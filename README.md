@@ -35,10 +35,14 @@ batean osorik exekutatzen dena.
 2. Esaldi bakoitza transkribatu. Esaldi bakoitzaren **ahots-tonua (F0)**
    neurtzen da: mediana 165 Hz-tik gora bada **Maider** (emakumea), bestela
    **Antton** (gizona).
-3. **Berrikuspena:** SRT editagarria `[Maider] testua` / `[Antton] testua`
-   etiketekin. Testua zuzendu edo etiketa aldatu daiteke ahotsa aldatzeko.
-4. Itzulpena (berriz editagarria) → esaldi bakoitza bere ahotsarekin sintetizatu
-   → jatorrizko denbora-marketan kokatu (behar bada 1.6× arte azkartuta).
+3. **Berrikuspena:** esaldi bakoitza laukitxo batean: hasiera, amaiera, ahotsa
+   (Maider/Antton hautatzailea) eta testua. Esaldiak gehitu/ezabatu daitezke,
+   laukitxoan klik eginda bideoa esaldi horretara doa, eta erreproduzitzean
+   uneko esaldia nabarmentzen da. **SRT-a igo eta deskargatu** daiteke; ahotsa
+   `[Maider] testua` / `[Antton] testua` etiketa gisa gordetzen da fitxategian.
+4. Itzulpena (laukitxoetan berriz editagarria, jatorrizko esaldia azpian) →
+   esaldi bakoitza bere ahotsarekin sintetizatu → jatorrizko denbora-marketan
+   kokatu (behar bada 1.6× arte azkartuta).
 5. Ahotsa entzun, onartu, eta MP4 finala deskargatu.
 
 Gaztelaniaz ere Maider eta Antton entzuten dira: irudia eraikitzean euskal
@@ -48,12 +52,21 @@ gaztelaniazko Pocket TTS ereduak klip horretatik klonatzen du ahotsa.
 ## CPU-n errendimendua
 
 Ereduak txikiak dira (STT ~119M parametro, MT ~75M, TTS ONNX int8 ~160 MB).
-Space-ko `cpu-basic` hardwarean (2 vCPU, 16 GB) memoria nahikoa dago
-eredu guztiak batera kargatzeko (~4 GB). Abiadura gutxi gorabehera:
+Eredu guztiak kargatuta, edukiontziak ~3.2 GB memoria erabiltzen du;
+Space-ko `cpu-basic` hardwarea (2 vCPU, 16 GB) nahikoa da.
 
-- STT: denbora errealaren ~0.1× (minutu bat audio ~6-10 s)
-- MT: esaldiko ~0.1-0.3 s
-- TTS: denbora errealaren ~0.25× (2 harirekin ~4× denbora errealean baino azkarrago)
+Tokian neurtua, 2 CPU-rekin (`--cpus=2`, `NUM_THREADS=2`), 14 s-ko bideo
+batekin (lau esaldi, bi hizlari):
+
+| Urratsa | Denbora |
+|---|---|
+| Transkripzioa + ahotsen detekzioa | ~2 s |
+| Itzulpena | ~1.5 s |
+| Ahots-sintesia | ~8-12 s (bideoaren iraupenaren ~0.6-0.8×) |
+| Bideo finala | ~0.5 s |
+
+Sintesia da urratsik motelena: minutu bateko bideo batek ~1 minutu behar du gutxi
+gorabehera. Abiaraztean ereduak ~1-2 minututan kargatzen dira.
 
 ## Tokian exekutatu
 

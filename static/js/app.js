@@ -36,15 +36,26 @@ const retryBtn = document.getElementById('retryBtn');
 
 // Step-by-step review cards
 const transcriptReviewCard = document.getElementById('transcriptReviewCard');
-const transcriptSrtEditor = document.getElementById('transcriptSrtEditor');
+const transcriptSubtitleEditor = document.getElementById('transcriptSubtitleEditor');
 const approveTranscriptBtn = document.getElementById('approveTranscriptBtn');
 const translationReviewCard = document.getElementById('translationReviewCard');
-const translationSrtViewer = document.getElementById('translationSrtViewer');
+const translationSubtitleEditor = document.getElementById('translationSubtitleEditor');
+const srtFileInput = document.getElementById('srtFileInput');
+const downloadResultSrtBtn = document.getElementById('downloadResultSrtBtn');
 const approveTranslationBtn = document.getElementById('approveTranslationBtn');
 const synthesisReviewCard = document.getElementById('synthesisReviewCard');
 const approveSynthesisBtn = document.getElementById('approveSynthesisBtn');
 
 let currentJobId = null;
+let resultSrt = '';
+let srtUploadTarget = null;
+
+// Generoa -> ahotsaren izena (backend-eko config.VOICES-en berdina)
+const VOICE_NAMES = { female: 'Maider', male: 'Antton' };
+const VOICE_ALIASES = {
+    maider: 'female', emakumea: 'female', mujer: 'female', female: 'female', f: 'female',
+    antton: 'male', gizona: 'male', hombre: 'male', male: 'male', m: 'male',
+};
 
 const synthesisAudio = document.getElementById('synthesisAudio');
 
@@ -248,7 +259,7 @@ function startPolling(jobId) {
             switch (data.state) {
                 case 'awaiting_transcript_review':
                     stopPolling();
-                    transcriptSrtEditor.value = data.srt || '';
+                    renderSubtitleEditor(transcriptSubtitleEditor, data.subtitles || []);
                     progressCard.style.display = 'none';
                     transcriptReviewCard.style.display = 'block';
                     submitBtn.disabled = false;
@@ -256,7 +267,7 @@ function startPolling(jobId) {
 
                 case 'awaiting_translation_review':
                     stopPolling();
-                    translationSrtViewer.value = data.srt_translated || '';
+                    renderSubtitleEditor(translationSubtitleEditor, data.subtitles || []);
                     progressCard.style.display = 'none';
                     translationReviewCard.style.display = 'block';
                     break;
@@ -275,6 +286,7 @@ function startPolling(jobId) {
                     originalText.textContent = result.transcription || '(ez dago testurik)';
                     translatedText.textContent = result.translated_text || '(ez dago testurik)';
                     downloadBtn.href = result.download_url;
+                    resultSrt = result.srt_translated || '';
                     setTimeout(() => {
                         progressCard.style.display = 'none';
                         resultsCard.style.display = 'block';
@@ -305,21 +317,293 @@ function stopPolling() {
 }
 
 // ---------------------------------------------------------------------------
+// Azpititulu-editorea: esaldi bakoitza laukitxo batean (denborak, ahotsa, testua)
+// ---------------------------------------------------------------------------
+function createSubtitleRow(subtitle, index) {
+    const row = document.createElement('div');
+    row.className = 'subtitle-row';
+    if (subtitle.source) row.dataset.source = subtitle.source;
+
+    const number = document.createElement('span');
+    number.className = 'subtitle-number';
+
+    const start = document.createElement('input');
+    start.type = 'number';
+    start.className = 'subtitle-time subtitle-start';
+    start.min = '0';
+    start.step = '0.01';
+    start.value = Number(subtitle.start || 0).toFixed(2);
+    start.title = 'Hasiera (s)';
+
+    const end = document.createElement('input');
+    end.type = 'number';
+    end.className = 'subtitle-time subtitle-end';
+    end.min = '0.01';
+    end.step = '0.01';
+    end.value = Number(subtitle.end || 2).toFixed(2);
+    end.title = 'Amaiera (s)';
+
+    const voice = document.createElement('select');
+    voice.className = 'subtitle-voice';
+    Object.entries(VOICE_NAMES).forEach(([gender, name]) => {
+        const opt = document.createElement('option');
+        opt.value = gender;
+        opt.textContent = name;
+        voice.appendChild(opt);
+    });
+    voice.value = VOICE_NAMES[subtitle.gender] ? subtitle.gender : 'male';
+    voice.title = 'Esaldi hau irakurriko duen ahotsa';
+    const paintVoice = () => { row.dataset.gender = voice.value; };
+    voice.addEventListener('change', paintVoice);
+    paintVoice();
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'subtitle-delete';
+    remove.textContent = '×';
+    remove.title = 'Esaldia ezabatu';
+    remove.addEventListener('click', () => {
+        const editor = row.parentElement;
+        row.remove();
+        renumberSubtitleRows(editor);
+    });
+
+    const text = document.createElement('textarea');
+    text.className = 'subtitle-text';
+    text.rows = 2;
+    text.value = subtitle.text || '';
+
+    const head = document.createElement('div');
+    head.className = 'subtitle-head';
+    const times = document.createElement('div');
+    times.className = 'subtitle-times';
+    const arrow = document.createElement('span');
+    arrow.className = 'subtitle-arrow';
+    arrow.textContent = '→';
+    times.append(start, arrow, end);
+    head.append(number, times, voice, remove);
+    row.append(head, text);
+
+    if (subtitle.source) {
+        const src = document.createElement('p');
+        src.className = 'subtitle-source';
+        src.textContent = subtitle.source;
+        row.appendChild(src);
+    }
+
+    row.addEventListener('click', event => {
+        if (event.target.matches('input, textarea, button, select')) return;
+        if (videoPreview.src) videoPreview.currentTime = Number(start.value) || 0;
+    });
+    return row;
+}
+
+function renumberSubtitleRows(editor) {
+    [...editor.querySelectorAll('.subtitle-row')].forEach((row, index) => {
+        row.querySelector('.subtitle-number').textContent = index + 1;
+    });
+}
+
+function renderSubtitleEditor(editor, subtitles) {
+    editor.replaceChildren(...subtitles.map((sub, i) => createSubtitleRow(sub, i)));
+    renumberSubtitleRows(editor);
+}
+
+function addSubtitle(editor) {
+    const rows = editor.querySelectorAll('.subtitle-row');
+    const last = rows[rows.length - 1];
+    const lastEnd = last ? Number(last.querySelector('.subtitle-end').value) : 0;
+    const gender = last ? last.querySelector('.subtitle-voice').value : 'male';
+    editor.appendChild(createSubtitleRow({ start: lastEnd, end: lastEnd + 2, text: '', gender }, rows.length));
+    renumberSubtitleRows(editor);
+    editor.lastElementChild.querySelector('.subtitle-text').focus();
+}
+
+function collectSubtitles(editor) {
+    const subtitles = [...editor.querySelectorAll('.subtitle-row')].map((row, index) => {
+        const start = Number(row.querySelector('.subtitle-start').value);
+        const end = Number(row.querySelector('.subtitle-end').value);
+        const text = row.querySelector('.subtitle-text').value.trim();
+        const gender = row.querySelector('.subtitle-voice').value;
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !text) {
+            row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            throw new Error(`${index + 1}. esaldia osatu eta denborak zuzendu (amaiera > hasiera).`);
+        }
+        const sub = { start, end, text, gender };
+        if (row.dataset.source) sub.source = row.dataset.source;
+        return sub;
+    });
+    if (!subtitles.length) throw new Error('Gutxienez esaldi bat behar da.');
+    return subtitles;
+}
+
+async function saveSubtitles(editor) {
+    const res = await fetch(`${API_BASE}/api/job/${currentJobId}/subtitles`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subtitles: collectSubtitles(editor) }),
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || 'Azpitituluak ezin izan dira gorde');
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SRT igo / jaitsi. Ahotsa "[Maider] testua" etiketa gisa gordetzen da.
+// ---------------------------------------------------------------------------
+function formatSrtTimestamp(seconds) {
+    const totalMillis = Math.max(0, Math.round(seconds * 1000));
+    const hours = Math.floor(totalMillis / 3600000);
+    const minutes = Math.floor((totalMillis % 3600000) / 60000);
+    const secs = Math.floor((totalMillis % 60000) / 1000);
+    const millis = totalMillis % 1000;
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(millis).padStart(3, '0')}`;
+}
+
+function subtitlesToSrt(subtitles) {
+    return subtitles.map((sub, index) => [
+        index + 1,
+        `${formatSrtTimestamp(sub.start)} --> ${formatSrtTimestamp(sub.end)}`,
+        `[${VOICE_NAMES[sub.gender] || VOICE_NAMES.male}] ${sub.text}`,
+        '',
+    ].join('\n')).join('\n');
+}
+
+function parseSrtTimestamp(value) {
+    const match = value.trim().match(/^(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/);
+    if (!match) throw new Error(`SRT denbora baliogabea: ${value}`);
+    return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3])
+        + Number(match[4].padEnd(3, '0')) / 1000;
+}
+
+function srtToSubtitles(srt, previous) {
+    const normalized = srt.replace(/^﻿/, '').replace(/\r\n?/g, '\n').trim();
+    if (!normalized) throw new Error('SRT fitxategia hutsik dago.');
+
+    return normalized.split(/\n\s*\n/).map((block, index) => {
+        const lines = block.split('\n');
+        const timeIndex = lines.findIndex(line => line.includes('-->'));
+        if (timeIndex < 0) throw new Error(`${index + 1}. SRT blokeak ez du denborarik.`);
+        const [startRaw, endRaw] = lines[timeIndex].split(/\s*-->\s*/);
+        let text = lines.slice(timeIndex + 1).join(' ').replace(/<[^>]+>/g, '').trim();
+        let gender = null;
+        const tag = text.match(/^\[([^\]]+)\]\s*/);
+        if (tag && VOICE_ALIASES[tag[1].trim().toLowerCase()]) {
+            gender = VOICE_ALIASES[tag[1].trim().toLowerCase()];
+            text = text.slice(tag[0].length).trim();
+        }
+        if (!text) throw new Error(`${index + 1}. SRT blokeak ez du testurik.`);
+        const sub = {
+            start: parseSrtTimestamp(startRaw),
+            end: parseSrtTimestamp(endRaw),
+            text,
+            gender: gender || (previous[index] && previous[index].gender) || 'male',
+        };
+        if (sub.end <= sub.start) {
+            throw new Error(`${index + 1}. SRT blokearen amaiera hasieraren ondoren izan behar da.`);
+        }
+        return sub;
+    });
+}
+
+function downloadText(content, filename) {
+    const blobUrl = URL.createObjectURL(new Blob([content], { type: 'application/x-subrip;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+}
+
+function baseName() {
+    return selectedFile?.name.replace(/\.[^.]+$/, '') || 'bideoa';
+}
+
+document.querySelectorAll('.srt-download-btn').forEach(button => {
+    button.addEventListener('click', () => {
+        try {
+            const editor = document.getElementById(button.dataset.editor);
+            downloadText(subtitlesToSrt(collectSubtitles(editor)), `${baseName()}_${button.dataset.suffix}.srt`);
+        } catch (err) {
+            showError(err.message);
+        }
+    });
+});
+
+document.querySelectorAll('.srt-upload-btn').forEach(button => {
+    button.addEventListener('click', () => {
+        srtUploadTarget = document.getElementById(button.dataset.editor);
+        srtFileInput.click();
+    });
+});
+
+srtFileInput.addEventListener('change', async () => {
+    const file = srtFileInput.files[0];
+    if (!file || !srtUploadTarget) return;
+    try {
+        const previous = [...srtUploadTarget.querySelectorAll('.subtitle-row')].map(row => ({
+            gender: row.querySelector('.subtitle-voice').value,
+        }));
+        renderSubtitleEditor(srtUploadTarget, srtToSubtitles(await file.text(), previous));
+        hideError();
+    } catch (err) {
+        showError(err.message);
+    } finally {
+        srtFileInput.value = '';
+    }
+});
+
+document.querySelectorAll('.add-subtitle-btn').forEach(button => {
+    button.addEventListener('click', () => addSubtitle(document.getElementById(button.dataset.editor)));
+});
+
+document.querySelectorAll('.bulk-voice-btn').forEach(button => {
+    button.addEventListener('click', () => {
+        const editor = document.getElementById(button.dataset.editor);
+        editor.querySelectorAll('.subtitle-voice').forEach(select => {
+            select.value = button.dataset.gender;
+            select.dispatchEvent(new Event('change'));
+        });
+    });
+});
+
+downloadResultSrtBtn.addEventListener('click', () => {
+    if (resultSrt) downloadText(resultSrt, `${baseName()}_itzulpena.srt`);
+});
+
+// Bideoa erreproduzitzean uneko esaldia nabarmendu
+function syncActiveSubtitle() {
+    const t = videoPreview.currentTime;
+    [transcriptSubtitleEditor, translationSubtitleEditor].forEach(editor => {
+        if (editor.closest('.review-card').style.display === 'none') return;
+        let activeRow = null;
+        editor.querySelectorAll('.subtitle-row').forEach(row => {
+            const start = Number(row.querySelector('.subtitle-start').value);
+            const end = Number(row.querySelector('.subtitle-end').value);
+            const isActive = t >= start && t < end;
+            row.classList.toggle('active', isActive);
+            if (isActive) activeRow = row;
+        });
+        if (activeRow && !activeRow.matches(':focus-within') && !videoPreview.paused) {
+            const top = activeRow.offsetTop - editor.offsetTop;
+            if (top < editor.scrollTop || top + activeRow.offsetHeight > editor.scrollTop + editor.clientHeight) {
+                editor.scrollTo({ top: top - editor.clientHeight / 2 + activeRow.offsetHeight / 2, behavior: 'smooth' });
+            }
+        }
+    });
+}
+videoPreview.addEventListener('timeupdate', syncActiveSubtitle);
+videoPreview.addEventListener('seeked', syncActiveSubtitle);
+
+// ---------------------------------------------------------------------------
 // Urrats-1 onarpena: SRT (agian editatua) bidali eta itzulpena abiarazi
 // ---------------------------------------------------------------------------
 approveTranscriptBtn.addEventListener('click', async () => {
     if (!currentJobId) return;
     approveTranscriptBtn.disabled = true;
     try {
-        const putRes = await fetch(`${API_BASE}/api/job/${currentJobId}/srt`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ srt: transcriptSrtEditor.value }),
-        });
-        if (!putRes.ok) {
-            const err = await putRes.json().catch(() => ({ detail: putRes.statusText }));
-            throw new Error(err.detail || 'SRT ez da onartu');
-        }
+        await saveSubtitles(transcriptSubtitleEditor);
 
         const approveRes = await fetch(`${API_BASE}/api/job/${currentJobId}/approve`, {
             method: 'POST',
@@ -346,15 +630,7 @@ approveTranslationBtn.addEventListener('click', async () => {
     if (!currentJobId) return;
     approveTranslationBtn.disabled = true;
     try {
-        const putRes = await fetch(`${API_BASE}/api/job/${currentJobId}/srt`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ srt: translationSrtViewer.value }),
-        });
-        if (!putRes.ok) {
-            const err = await putRes.json().catch(() => ({ detail: putRes.statusText }));
-            throw new Error(err.detail || 'SRT ez da onartu');
-        }
+        await saveSubtitles(translationSubtitleEditor);
 
         const approveRes = await fetch(`${API_BASE}/api/job/${currentJobId}/approve`, {
             method: 'POST',

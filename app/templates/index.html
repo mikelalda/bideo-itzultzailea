@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bideo Itzultzailea - Video Translator</title>
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=2">
 </head>
 <body>
     <div class="container">
@@ -130,37 +130,70 @@
             </div>
         </div>
 
-        <!-- Transcript review (urrats-1: SRT editagarria, itzuli aurretik) -->
+        <!-- Transcript review (urrats-1: esaldi bakoitza laukitxo batean) -->
         <div class="card review-card" id="transcriptReviewCard" style="display: none;">
             <h3>1. Berrikusi transkripzioa</h3>
             <p class="review-hint">
-                Zuzendu behar duzun testua SRT formatuan dago. Esaldi bakoitzaren
-                hasieran dagoen <code>[Maider]</code> edo <code>[Antton]</code> etiketak
-                zein ahotsek irakurriko duen adierazten du: aldatu nahi baduzu, idatzi
-                bestea. Gustura zaudenean, onartu itzultzeko.
+                Esaldi bakoitza laukitxo batean dago. Zuzendu testua edo denborak, eta
+                aukeratu zein ahotsek irakurriko duen (Maider edo Antton). Laukitxoan
+                klik eginda, bideoa esaldi horretara joango da.
             </p>
-            <textarea id="transcriptSrtEditor" class="srt-editor" spellcheck="false"></textarea>
+            <div class="subtitle-file-actions">
+                <button type="button" class="btn-secondary srt-download-btn" data-editor="transcriptSubtitleEditor" data-suffix="transkripzioa">
+                    ⬇️ SRT deskargatu
+                </button>
+                <button type="button" class="btn-secondary srt-upload-btn" data-editor="transcriptSubtitleEditor">
+                    📤 SRT igo
+                </button>
+                <span class="voice-bulk">
+                    Guztiak:
+                    <button type="button" class="btn-link bulk-voice-btn" data-editor="transcriptSubtitleEditor" data-gender="female">Maider</button>
+                    <button type="button" class="btn-link bulk-voice-btn" data-editor="transcriptSubtitleEditor" data-gender="male">Antton</button>
+                </span>
+            </div>
+            <div id="transcriptSubtitleEditor" class="subtitle-editor"></div>
             <div class="result-actions">
+                <button type="button" class="btn-secondary add-subtitle-btn" data-editor="transcriptSubtitleEditor">
+                    + Esaldia
+                </button>
                 <button type="button" class="btn-primary" id="approveTranscriptBtn">
                     ✅ Onartu eta itzuli
                 </button>
             </div>
         </div>
 
-        <!-- Translation review (urrats-2: SRT itzulia, irakurtzeko) -->
+        <!-- Translation review (urrats-2: itzulpena laukitxoetan, editagarria) -->
         <div class="card review-card" id="translationReviewCard" style="display: none;">
             <h3>2. Berrikusi itzulpena</h3>
             <p class="review-hint">
-                Itzulpena honela geratu da. Testua eta <code>[Maider]</code>/<code>[Antton]</code>
-                etiketak oraindik zuzen ditzakezu. Onartzen baduzu, ahotsa sortuko da.
+                Zuzendu itzulpena, denborak edo ahotsa sintesia egin aurretik. Laukitxo
+                bakoitzaren azpian jatorrizko esaldia ikus dezakezu.
             </p>
-            <textarea id="translationSrtViewer" class="srt-editor" spellcheck="false"></textarea>
+            <div class="subtitle-file-actions">
+                <button type="button" class="btn-secondary srt-download-btn" data-editor="translationSubtitleEditor" data-suffix="itzulpena">
+                    ⬇️ SRT deskargatu
+                </button>
+                <button type="button" class="btn-secondary srt-upload-btn" data-editor="translationSubtitleEditor">
+                    📤 SRT igo
+                </button>
+                <span class="voice-bulk">
+                    Guztiak:
+                    <button type="button" class="btn-link bulk-voice-btn" data-editor="translationSubtitleEditor" data-gender="female">Maider</button>
+                    <button type="button" class="btn-link bulk-voice-btn" data-editor="translationSubtitleEditor" data-gender="male">Antton</button>
+                </span>
+            </div>
+            <div id="translationSubtitleEditor" class="subtitle-editor"></div>
             <div class="result-actions">
+                <button type="button" class="btn-secondary add-subtitle-btn" data-editor="translationSubtitleEditor">
+                    + Esaldia
+                </button>
                 <button type="button" class="btn-primary" id="approveTranslationBtn">
                     ✅ Onartu eta ahotsa sortu
                 </button>
             </div>
         </div>
+
+        <input type="file" id="srtFileInput" accept=".srt,application/x-subrip,text/plain" hidden>
 
         <!-- Synthesis review (urrats-3: ahotsa sortuta, bideoa falta) -->
         <div class="card review-card" id="synthesisReviewCard" style="display: none;">
@@ -189,6 +222,9 @@
                 <a class="btn-primary btn-download" id="downloadBtn" href="#" download>
                     ⬇️ Itzulitako bideoa deskargatu
                 </a>
+                <button type="button" class="btn-secondary" id="downloadResultSrtBtn">
+                    ⬇️ SRT itzulia
+                </button>
                 <button class="btn-secondary" id="newTranslation">
                     🔄 Itzulpen berria
                 </button>
@@ -209,6 +245,6 @@
         </footer>
     </div>
 
-    <script src="/static/js/app.js"></script>
+    <script src="/static/js/app.js?v=2"></script>
 </body>
 </html>

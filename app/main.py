@@ -32,6 +32,8 @@ from fastapi.requests import Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from typing import List, Optional
+
 from pydantic import BaseModel
 
 from app import config
@@ -128,28 +130,11 @@ def cleanup_old_files():
 
 
 # ---------------------------------------------------------------------------
-# SRT + ahots-etiketak:  "[Maider] Testua"  /  "[Antton] Testua"
+# Azpitituluak. Barnean: {"text", "timestamp": [s, e], "gender"}.
+# APIan: {"start", "end", "text", "gender", ["source"]}. SRT fitxategiak
+# nabigatzailean sortu/irakurtzen dira, "[Maider] testua" etiketekin.
 # ---------------------------------------------------------------------------
-_SRT_TIME_RE = re.compile(
-    r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})"
-)
-_TAG_RE = re.compile(r"^\s*\[([^\]]+)\]\s*")
-_GENDER_ALIASES = {
-    "female": "female", "emakumea": "female", "mujer": "female", "f": "female", "e": "female",
-    "male": "male", "gizona": "male", "hombre": "male", "m": "male", "g": "male",
-}
-for _g, _name in config.VOICES.items():
-    _GENDER_ALIASES[_name.lower()] = _g
-
-
-def split_voice_tag(text: str):
-    m = _TAG_RE.match(text)
-    if not m:
-        return None, text.strip()
-    gender = _GENDER_ALIASES.get(m.group(1).strip().lower())
-    if gender is None:  # ezezaguna: testuaren parte gisa utzi
-        return None, text.strip()
-    return gender, text[m.end():].strip()
+GENDERS = tuple(config.VOICES)  # ("female", "male")
 
 
 def _srt_timestamp(seconds) -> str:
@@ -174,26 +159,50 @@ def chunks_to_srt(chunks: list) -> str:
     return "\n".join(lines)
 
 
-def srt_to_chunks(srt_text: str, previous: list) -> list:
-    """SRT editatua irakurri. Etiketarik gabeko esaldiek lehengo ahotsa mantentzen dute."""
+def chunks_to_subtitles(chunks: list) -> list:
+    out = []
+    for c in chunks:
+        item = {
+            "start": c["timestamp"][0],
+            "end": c["timestamp"][1],
+            "text": c.get("text", ""),
+            "gender": c.get("gender") or "male",
+        }
+        if "source" in c:
+            item["source"] = c["source"]
+        out.append(item)
+    return out
+
+
+class Subtitle(BaseModel):
+    start: float
+    end: float
+    text: str
+    gender: str = "male"
+    source: Optional[str] = None
+
+
+class SubtitlesUpdate(BaseModel):
+    subtitles: List[Subtitle]
+
+
+def subtitles_to_chunks(subtitles: List[Subtitle]) -> list:
     chunks = []
-    for block in re.split(r"\n\s*\n", srt_text.strip()):
-        lines = [l for l in block.splitlines() if l.strip()]
-        time_idx = next((i for i, l in enumerate(lines) if _SRT_TIME_RE.search(l)), None)
-        if time_idx is None:
-            continue
-        g = _SRT_TIME_RE.search(lines[time_idx]).groups()
-        start = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3]) / 1000.0
-        end = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7]) / 1000.0
-        gender, text = split_voice_tag(" ".join(lines[time_idx + 1:]))
+    for i, sub in enumerate(subtitles, start=1):
+        text = " ".join(sub.text.split())
         if not text:
-            continue
-        if gender is None:
-            idx = len(chunks)
-            gender = previous[idx].get("gender") if idx < len(previous) else "male"
-        chunks.append({"text": text, "timestamp": [start, end], "gender": gender or "male"})
+            raise ValueError(f"{i}. azpitituluak ez du testurik")
+        if sub.start < 0 or sub.end <= sub.start:
+            raise ValueError(f"{i}. azpitituluaren amaiera hasieraren ondoren izan behar da")
+        if sub.gender not in GENDERS:
+            raise ValueError(f"{i}. azpitituluaren ahotsa baliogabea: {sub.gender}")
+        chunk = {"text": text, "timestamp": [round(sub.start, 3), round(sub.end, 3)],
+                 "gender": sub.gender}
+        if sub.source is not None:
+            chunk["source"] = sub.source
+        chunks.append(chunk)
     if not chunks:
-        raise ValueError("Ez da SRT bloke baliozkorik aurkitu")
+        raise ValueError("Gutxienez azpititulu bat behar da")
     chunks.sort(key=lambda c: c["timestamp"][0])
     return chunks
 
@@ -228,10 +237,6 @@ async def get_voices():
     return {"modes": list(VOICE_MODES), "voices": config.VOICES}
 
 
-class SrtUpdate(BaseModel):
-    srt: str
-
-
 @app.get("/api/job/{job_id}")
 async def get_job_status(job_id: str):
     job = job_status.get(job_id)
@@ -239,9 +244,9 @@ async def get_job_status(job_id: str):
         return {"state": "unknown", "progress": 0, "detail": "Job not found"}
     response = {k: job.get(k) for k in ("state", "progress", "detail")}
     if job.get("state") == "awaiting_transcript_review":
-        response["srt"] = job.get("srt", "")
+        response["subtitles"] = chunks_to_subtitles(job.get("chunks") or [])
     if job.get("state") == "awaiting_translation_review":
-        response["srt_translated"] = job.get("srt_translated", "")
+        response["subtitles"] = chunks_to_subtitles(job.get("translated_chunks") or [])
     if job.get("state") == "awaiting_synthesis_review":
         response["audio_url"] = f"/api/job/{job_id}/audio"
     if job.get("state") == "completed":
@@ -249,26 +254,24 @@ async def get_job_status(job_id: str):
     return response
 
 
-@app.put("/api/job/{job_id}/srt")
-async def update_job_srt(job_id: str, body: SrtUpdate):
-    """SRT editatua gorde (transkripzioa edo itzulpena, berrikuspen-urratsean)."""
+@app.put("/api/job/{job_id}/subtitles")
+async def update_job_subtitles(job_id: str, body: SubtitlesUpdate):
+    """Editatutako azpitituluak gorde (transkripzioa edo itzulpena berrikustean)."""
     job = job_status.get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
     state = job.get("state")
     if state == "awaiting_transcript_review":
-        key_chunks, key_srt = "chunks", "srt"
+        key = "chunks"
     elif state == "awaiting_translation_review":
-        key_chunks, key_srt = "translated_chunks", "srt_translated"
+        key = "translated_chunks"
     else:
-        raise HTTPException(400, f"Job ez dago SRT-a editatzeko egoeran (egoera: {state})")
+        raise HTTPException(400, f"Job ez dago azpitituluak editatzeko egoeran (egoera: {state})")
     try:
-        chunks = srt_to_chunks(body.srt, job.get(key_chunks) or [])
+        job[key] = subtitles_to_chunks(body.subtitles)
     except ValueError as e:
-        raise HTTPException(400, f"SRT baliogabea: {e}")
-    job[key_chunks] = chunks
-    job[key_srt] = chunks_to_srt(chunks)
-    return {"success": True}
+        raise HTTPException(400, str(e))
+    return {"success": True, "subtitles": chunks_to_subtitles(job[key])}
 
 
 @app.post("/api/job/{job_id}/approve")
@@ -384,7 +387,7 @@ async def run_transcription(job_id: str):
             {"text": s["text"], "timestamp": [round(s["start"], 3), round(s["end"], 3)], "gender": g}
             for s, g in zip(segments, genders)
         ]
-        job.update({"chunks": chunks, "srt": chunks_to_srt(chunks)})
+        job["chunks"] = chunks
         update_job(job_id, "awaiting_transcript_review", 30,
                    "Berrikusi transkripzioa eta ahotsak, eta onartu itzultzeko")
     except Exception as e:
@@ -404,10 +407,11 @@ async def run_translation(job_id: str):
                 job["source_lang"], job["target_lang"],
             )
         translated = [
-            {"text": t, "timestamp": c["timestamp"], "gender": c.get("gender", "male")}
+            {"text": t, "timestamp": c["timestamp"], "gender": c.get("gender", "male"),
+             "source": c["text"]}
             for c, t in zip(chunks, texts) if t
         ]
-        job.update({"translated_chunks": translated, "srt_translated": chunks_to_srt(translated)})
+        job["translated_chunks"] = translated
         update_job(job_id, "awaiting_translation_review", 55,
                    "Berrikusi itzulpena eta onartu ahotsa sortzeko")
     except Exception as e:
@@ -471,7 +475,7 @@ async def run_finalize(job_id: str):
                 "download_url": f"/api/download/{output_filename}",
                 "transcription": " ".join(c["text"] for c in job["chunks"]),
                 "translated_text": " ".join(c["text"] for c in job["translated_chunks"]),
-                "srt_translated": job.get("srt_translated", ""),
+                "srt_translated": chunks_to_srt(job["translated_chunks"]),
             },
         })
         logger.info(f"[{job_id}] completed (100%)")

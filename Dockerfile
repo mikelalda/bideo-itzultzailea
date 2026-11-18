@@ -36,14 +36,18 @@ RUN pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
-COPY app/ /app/app/
-COPY static/ /app/static/
+# Ereduak deskargatu + gaztelaniazko ahots-erreferentziak sortu. Behar diren
+# moduluak bakarrik kopiatzen dira lehenik, UI-ko aldaketek (main.py, static/)
+# geruza hau ez baliogabetzeko eta ereduak berriz ez deskargatzeko.
+COPY app/__init__.py app/config.py app/textnorm.py app/translator.py app/tts.py /app/app/
+COPY app/vendor/ /app/app/vendor/
 COPY scripts/ /app/scripts/
-
-# Ereduak deskargatu + gaztelaniazko ahots-erreferentziak sortu
 RUN python /app/scripts/prepare_models.py \
     && mkdir -p /app/data \
     && chown -R user:user /app/data /opt/models
+
+COPY app/ /app/app/
+COPY static/ /app/static/
 
 USER user
 ENV HOME=/home/user \
