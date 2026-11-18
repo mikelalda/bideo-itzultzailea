@@ -1,49 +1,57 @@
 # =============================================================================
-# Bideo Itzultzailea - Orchestrator Dockerfile
+# Bideo Itzultzailea - CPU irudia (Hugging Face Spaces eta tokikoa)
+#
+#   STT: NVIDIA NeMo Conformer-Transducer (es: nvidia, eu: HiTZ v2)
+#   MT : HiTZ/mt-hitz-es-eu eta HiTZ/mt-hitz-eu-es (MarianMT)
+#   TTS: Pocket TTS ONNX (eu: itzune/pocket-tts-basque-onnx, es: Kyutai spanish)
+#
+# Prozesu bakarra (uvicorn) 7860 atakan. Ereduak eraikitzean deskargatzen dira.
+# HF Spaces-ek 1000 UID-a duen erabiltzailearekin exekutatzen du edukiontzia.
 # =============================================================================
+FROM python:3.12-slim-bookworm
 
-FROM python:3.11-slim-bookworm
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/opt/models/hf \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    VOICE_CACHE_DIR=/opt/models/voices \
+    DATA_DIR=/app/data
 
-LABEL maintainer="Bideo Itzultzailea"
-LABEL description="Video translation system ES ↔ EU"
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-
-# Install ffmpeg and system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
+        ffmpeg \
+        libsndfile1 \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 user
 
 WORKDIR /app
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# torch CPU bertsioa (CUDA gabe, irudia askoz txikiagoa)
+RUN pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
 
-# Pre-download translation models at build time
-RUN python -c "\
-from transformers import MarianMTModel, MarianTokenizer; \
-MarianTokenizer.from_pretrained('Helsinki-NLP/opus-mt-es-eu'); \
-MarianMTModel.from_pretrained('Helsinki-NLP/opus-mt-es-eu'); \
-MarianTokenizer.from_pretrained('Helsinki-NLP/opus-mt-eu-es'); \
-MarianMTModel.from_pretrained('Helsinki-NLP/opus-mt-eu-es'); \
-print('Models downloaded successfully')"
+COPY requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt
 
-# Copy application code
 COPY app/ /app/app/
 COPY static/ /app/static/
+COPY scripts/ /app/scripts/
 
-# Symlink templates for Jinja2
-RUN ln -sf /app/app/templates /app/templates
+# Ereduak deskargatu + gaztelaniazko ahots-erreferentziak sortu
+RUN python /app/scripts/prepare_models.py \
+    && mkdir -p /app/data \
+    && chown -R user:user /app/data /opt/models
 
-# Create work directories
-RUN mkdir -p /app/uploads /app/outputs /app/temp
+USER user
+ENV HOME=/home/user \
+    HF_HUB_OFFLINE=1
 
-EXPOSE 5000
+EXPOSE 7860
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7860/api/health')" || exit 1
 
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]

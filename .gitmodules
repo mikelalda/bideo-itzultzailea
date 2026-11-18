@@ -1,6 +1,0 @@
-[submodule "services/whisper_API"]
-	path = services/whisper_API
-	url = https://github.com/mikelalda/whisper_API.git
-[submodule "services/aHoTTS_API"]
-	path = services/aHoTTS_API
-	url = https://github.com/mikelalda/aHoTTS_API.git

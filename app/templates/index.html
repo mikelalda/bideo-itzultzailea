@@ -17,16 +17,16 @@
         <!-- Service Status -->
         <div class="status-bar" id="statusBar">
             <div class="status-item">
-                <span class="status-dot" id="statusOrchestrator"></span>
-                <span>Orchestrator</span>
+                <span class="status-dot" id="statusStt"></span>
+                <span>STT (NeMo Conformer)</span>
             </div>
             <div class="status-item">
-                <span class="status-dot" id="statusWhisper"></span>
-                <span>Whisper (STT)</span>
+                <span class="status-dot" id="statusMt"></span>
+                <span>Itzulpena (HiTZ)</span>
             </div>
             <div class="status-item">
-                <span class="status-dot" id="statusAhotts"></span>
-                <span>aHoTTS (TTS)</span>
+                <span class="status-dot" id="statusTts"></span>
+                <span>TTS (Pocket TTS)</span>
             </div>
         </div>
 
@@ -56,8 +56,8 @@
                     <div class="form-group">
                         <label for="sourceLang">Jatorrizko hizkuntza</label>
                         <select id="sourceLang" required>
-                            <option value="es">🇪🇸 Castellano</option>
-                            <option value="eu">🇺🇾 Euskera</option>
+                            <option value="es">Castellano</option>
+                            <option value="eu">Euskera</option>
                         </select>
                     </div>
 
@@ -68,8 +68,8 @@
                     <div class="form-group">
                         <label for="targetLang">Helburu hizkuntza</label>
                         <select id="targetLang" required>
-                            <option value="eu">🇺🇾 Euskera</option>
-                            <option value="es">🇪🇸 Castellano</option>
+                            <option value="eu">Euskera</option>
+                            <option value="es">Castellano</option>
                         </select>
                     </div>
                 </div>
@@ -78,7 +78,9 @@
                 <div class="form-group">
                     <label for="voice">Ahots sintetikoa</label>
                     <select id="voice" required>
-                        <option value="" disabled>Ahotsak kargatzen...</option>
+                        <option value="auto" selected>Automatikoa: esaldi bakoitzean Maider edo Antton (ahots-tonuaren arabera)</option>
+                        <option value="female">Maider (emakumea) esaldi guztietan</option>
+                        <option value="male">Antton (gizona) esaldi guztietan</option>
                     </select>
                 </div>
 
@@ -128,6 +130,50 @@
             </div>
         </div>
 
+        <!-- Transcript review (urrats-1: SRT editagarria, itzuli aurretik) -->
+        <div class="card review-card" id="transcriptReviewCard" style="display: none;">
+            <h3>1. Berrikusi transkripzioa</h3>
+            <p class="review-hint">
+                Zuzendu behar duzun testua SRT formatuan dago. Esaldi bakoitzaren
+                hasieran dagoen <code>[Maider]</code> edo <code>[Antton]</code> etiketak
+                zein ahotsek irakurriko duen adierazten du: aldatu nahi baduzu, idatzi
+                bestea. Gustura zaudenean, onartu itzultzeko.
+            </p>
+            <textarea id="transcriptSrtEditor" class="srt-editor" spellcheck="false"></textarea>
+            <div class="result-actions">
+                <button type="button" class="btn-primary" id="approveTranscriptBtn">
+                    ✅ Onartu eta itzuli
+                </button>
+            </div>
+        </div>
+
+        <!-- Translation review (urrats-2: SRT itzulia, irakurtzeko) -->
+        <div class="card review-card" id="translationReviewCard" style="display: none;">
+            <h3>2. Berrikusi itzulpena</h3>
+            <p class="review-hint">
+                Itzulpena honela geratu da. Testua eta <code>[Maider]</code>/<code>[Antton]</code>
+                etiketak oraindik zuzen ditzakezu. Onartzen baduzu, ahotsa sortuko da.
+            </p>
+            <textarea id="translationSrtViewer" class="srt-editor" spellcheck="false"></textarea>
+            <div class="result-actions">
+                <button type="button" class="btn-primary" id="approveTranslationBtn">
+                    ✅ Onartu eta ahotsa sortu
+                </button>
+            </div>
+        </div>
+
+        <!-- Synthesis review (urrats-3: ahotsa sortuta, bideoa falta) -->
+        <div class="card review-card" id="synthesisReviewCard" style="display: none;">
+            <h3>3. Ahotsa sortuta</h3>
+            <p class="review-hint">Ahotsa sortu da. Entzun eta, onartzen baduzu, bideo finala sortuko da.</p>
+            <audio id="synthesisAudio" controls preload="none" style="width: 100%; margin: 12px 0;"></audio>
+            <div class="result-actions">
+                <button type="button" class="btn-primary" id="approveSynthesisBtn">
+                    ✅ Onartu eta bideoa sortu
+                </button>
+            </div>
+        </div>
+
         <!-- Results -->
         <div class="card results-card" id="resultsCard" style="display: none;">
             <h3>Emaitza</h3>
@@ -158,8 +204,8 @@
 
         <!-- Footer -->
         <footer class="footer">
-            <p>Whisper API (STT) + MarianMT (Itzulpena) + aHoTTS (TTS)</p>
-            <p>Castellano ↔ Euskera bideo itzulpen sistema</p>
+            <p>NeMo Conformer-Transducer (STT) + HiTZ MarianMT (itzulpena) + Pocket TTS (ahotsa)</p>
+            <p>Castellano ↔ Euskera bideo itzulpen sistema, CPU-n</p>
         </footer>
     </div>
 

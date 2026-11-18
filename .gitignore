@@ -21,3 +21,4 @@ temp/
 Thumbs.db
 *.log
 models_cache/
+data/

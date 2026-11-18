@@ -1,496 +1,490 @@
 # =============================================================================
-# Bideo Itzultzailea - Video Translation Backend
-# Orchestrates: Whisper (STT) → Translation → aHoTTS (TTS)
-# Supports: Castellano ↔ Euskera
+# Bideo Itzultzailea - Bideoen itzulpena / bikoizketa (CPU)
+#
+#   ES -> EU: NVIDIA stt_es_conformer_transducer_large -> HiTZ/mt-hitz-es-eu
+#             -> Pocket TTS euskaraz
+#   EU -> ES: HiTZ/stt_eu_conformer_transducer_large_v2 -> HiTZ/mt-hitz-eu-es
+#             -> Pocket TTS gaztelaniaz
+#
+# Esaldi bakoitzak bere ahotsa du (Maider edo Antton), jatorrizko hizlariaren
+# ahots-tonuaren arabera erabakia; SRT-an [Maider]/[Antton] etiketa aldatuz
+# eskuz zuzen daiteke.
+#
+# Urratsak (bakoitzaren ondoren erabiltzailearen onarpenaren zain):
+#   1. transkripzioa (SRT editagarria)  2. itzulpena (SRT editagarria)
+#   3. ahotsa (entzun daiteke)          4. bideo finala
 # =============================================================================
 
-import os
-import re
-import uuid
-import json
-import time
-import logging
 import asyncio
-import tempfile
-import subprocess
+import logging
+import re
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 
-import httpx
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
+import soundfile as sf
+import torch
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.requests import Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.requests import Request
-from contextlib import asynccontextmanager
+from pydantic import BaseModel
 
-from translator import TextTranslator
+from app import config
+from app.audio import build_timeline, extract_audio, mux_video
+from app.gender import classify, fill_unknown, median_f0
+from app.stt import recognizer
+from app.translator import translator
+from app.tts import synthesizer
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-WHISPER_API_URL = os.getenv("WHISPER_API_URL", "http://whisper-api:8000")
-AHOTTS_API_URL = os.getenv("AHOTTS_API_URL", "http://ahotts-api:8000")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("bideo")
 
-UPLOAD_DIR = Path("/app/uploads")
-OUTPUT_DIR = Path("/app/outputs")
-TEMP_DIR = Path("/app/temp")
+torch.set_num_threads(config.NUM_THREADS)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
+LANGS = ("es", "eu")
+VOICE_MODES = ("auto", "female", "male")
+JOB_MAX_AGE_S = 24 * 3600
 
-# ---------------------------------------------------------------------------
-# Translation model
-# ---------------------------------------------------------------------------
-translator = TextTranslator()
+# Prozesatze astuna (STT/MT/TTS) bata bestearen atzetik: CPU bakarra dago.
+heavy_lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
-# Track job progress via WebSocket
+# Ereduen aurre-karga (atzealdean, /api/health berehala erantzuteko)
 # ---------------------------------------------------------------------------
-job_status = {}
+preload_state = {"running": False, "done": False, "error": None}
 
 
-def update_job(job_id: str, step: str, progress: int, detail: str = ""):
-    job_status[job_id] = {
-        "step": step,
-        "progress": progress,
-        "detail": detail,
-    }
-    logger.info(f"[{job_id}] {step} ({progress}%): {detail}")
+def _preload_models():
+    preload_state["running"] = True
+    try:
+        recognizer.load_vad()
+        for lang in LANGS:
+            recognizer.load(lang)
+        translator.load("es", "eu")
+        translator.load("eu", "es")
+        synthesizer.load("eu")
+        synthesizer.load("es")
+        # librosa.pyin-en JIT konpilazioa (~7 s) orain egin, ez lehen bideoan
+        t = np.arange(16000) / 16000.0
+        median_f0((0.3 * np.sin(2 * np.pi * 150 * t)).astype(np.float32))
+        preload_state["done"] = True
+        logger.info("Eredu guztiak kargatuta.")
+    except Exception as e:  # pragma: no cover - logean ikusteko
+        preload_state["error"] = str(e)
+        logger.exception("Ereduen aurre-kargak huts egin du")
+    finally:
+        preload_state["running"] = False
 
 
-# ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("Loading translation models...")
-    translator.load_models()
-    logger.info("Translation models loaded.")
+    for d in (config.UPLOAD_DIR, config.OUTPUT_DIR, config.TEMP_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    if config.PRELOAD_MODELS:
+        threading.Thread(target=_preload_models, daemon=True).start()
     yield
-    logger.info("Shutting down...")
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
 app = FastAPI(
     title="Bideo Itzultzailea",
-    description="Sistema de traducción de vídeo Castellano ↔ Euskera",
-    version="1.0.0",
+    description="Bideoen itzulpena Castellano <-> Euskera (CPU)",
+    version="2.0.0",
     lifespan=lifespan,
 )
+app.mount("/static", StaticFiles(directory=str(config.STATIC_DIR)), name="static")
+templates = Jinja2Templates(directory=str(config.TEMPLATES_DIR))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ---------------------------------------------------------------------------
+# Job-en egoera
+# ---------------------------------------------------------------------------
+job_status: dict = {}
+
+
+def update_job(job_id: str, state: str, progress: int, detail: str = ""):
+    job_status.setdefault(job_id, {})
+    job_status[job_id].update({"state": state, "progress": progress, "detail": detail})
+    logger.info(f"[{job_id}] {state} ({progress}%): {detail}")
+
+
+def set_job_error(job_id: str, message: str):
+    job_status.setdefault(job_id, {})
+    job_status[job_id].update({"state": "error", "progress": -1, "detail": message})
+
+
+def cleanup_old_files():
+    cutoff = time.time() - JOB_MAX_AGE_S
+    for d in (config.UPLOAD_DIR, config.OUTPUT_DIR, config.TEMP_DIR):
+        for p in d.glob("*"):
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# SRT + ahots-etiketak:  "[Maider] Testua"  /  "[Antton] Testua"
+# ---------------------------------------------------------------------------
+_SRT_TIME_RE = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})"
 )
-
-# Static files and templates
-app.mount("/static", StaticFiles(directory="/app/static"), name="static")
-templates = Jinja2Templates(directory="/app/templates")
-
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-def extract_audio(video_path: str, audio_path: str) -> float:
-    """Extract audio from video using ffmpeg. Returns duration in seconds."""
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-        audio_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg extract audio failed: {result.stderr}")
-
-    # Get duration
-    probe_cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", video_path
-    ]
-    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
-    duration = float(probe_result.stdout.strip())
-    return duration
+_TAG_RE = re.compile(r"^\s*\[([^\]]+)\]\s*")
+_GENDER_ALIASES = {
+    "female": "female", "emakumea": "female", "mujer": "female", "f": "female", "e": "female",
+    "male": "male", "gizona": "male", "hombre": "male", "m": "male", "g": "male",
+}
+for _g, _name in config.VOICES.items():
+    _GENDER_ALIASES[_name.lower()] = _g
 
 
-def adjust_audio_speed(input_path: str, output_path: str, speed_factor: float):
-    """Adjust audio speed using ffmpeg atempo filter."""
-    if speed_factor < 0.5:
-        speed_factor = 0.5
-    if speed_factor > 2.0:
-        speed_factor = 2.0
-
-    # atempo only supports 0.5 to 2.0, chain filters for wider range
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-filter:a", f"atempo={speed_factor}",
-        "-vn", output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg speed adjust failed: {result.stderr}")
+def split_voice_tag(text: str):
+    m = _TAG_RE.match(text)
+    if not m:
+        return None, text.strip()
+    gender = _GENDER_ALIASES.get(m.group(1).strip().lower())
+    if gender is None:  # ezezaguna: testuaren parte gisa utzi
+        return None, text.strip()
+    return gender, text[m.end():].strip()
 
 
-def get_audio_duration(audio_path: str) -> float:
-    """Get duration of audio file in seconds."""
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", audio_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed: {result.stderr}")
-    return float(result.stdout.strip())
+def _srt_timestamp(seconds) -> str:
+    ms_total = int(round(max(0.0, seconds or 0.0) * 1000))
+    h, rem = divmod(ms_total, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def replace_audio_in_video(video_path: str, audio_path: str, output_path: str):
-    """Replace the audio track of a video with a new audio file."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-shortest",
-        output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg replace audio failed: {result.stderr}")
+def chunks_to_srt(chunks: list) -> str:
+    lines = []
+    for i, chunk in enumerate(chunks, start=1):
+        start, end = chunk["timestamp"]
+        voice = config.VOICES.get(chunk.get("gender") or "male")
+        lines += [
+            str(i),
+            f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}",
+            f"[{voice}] {(chunk.get('text') or '').strip()}",
+            "",
+        ]
+    return "\n".join(lines)
 
 
-def concatenate_audio_segments(segment_paths: list, output_path: str):
-    """Concatenate multiple audio files using ffmpeg."""
-    if not segment_paths:
-        raise ValueError("No audio segments to concatenate")
-
-    list_file = output_path + ".list.txt"
-    with open(list_file, "w") as f:
-        for seg_path in segment_paths:
-            f.write(f"file '{seg_path}'\n")
-
-    cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", list_file, "-c", "copy", output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    os.remove(list_file)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg concat failed: {result.stderr}")
-
-
-def generate_silence(duration_sec: float, output_path: str):
-    """Generate silence audio of a given duration."""
-    cmd = [
-        "ffmpeg", "-y", "-f", "lavfi",
-        "-i", f"anullsrc=r=22050:cl=mono",
-        "-t", str(duration_sec),
-        "-acodec", "pcm_s16le",
-        output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg silence gen failed: {result.stderr}")
+def srt_to_chunks(srt_text: str, previous: list) -> list:
+    """SRT editatua irakurri. Etiketarik gabeko esaldiek lehengo ahotsa mantentzen dute."""
+    chunks = []
+    for block in re.split(r"\n\s*\n", srt_text.strip()):
+        lines = [l for l in block.splitlines() if l.strip()]
+        time_idx = next((i for i, l in enumerate(lines) if _SRT_TIME_RE.search(l)), None)
+        if time_idx is None:
+            continue
+        g = _SRT_TIME_RE.search(lines[time_idx]).groups()
+        start = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3]) / 1000.0
+        end = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7]) / 1000.0
+        gender, text = split_voice_tag(" ".join(lines[time_idx + 1:]))
+        if not text:
+            continue
+        if gender is None:
+            idx = len(chunks)
+            gender = previous[idx].get("gender") if idx < len(previous) else "male"
+        chunks.append({"text": text, "timestamp": [start, end], "gender": gender or "male"})
+    if not chunks:
+        raise ValueError("Ez da SRT bloke baliozkorik aurkitu")
+    chunks.sort(key=lambda c: c["timestamp"][0])
+    return chunks
 
 
 # ---------------------------------------------------------------------------
-# API Endpoints
+# API
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 
 @app.get("/api/health")
 async def health():
-    """Check health of all services."""
-    status = {"orchestrator": "ok"}
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            r = await client.get(f"{WHISPER_API_URL}/health")
-            status["whisper"] = r.json() if r.status_code == 200 else "error"
-        except Exception as e:
-            status["whisper"] = f"unreachable: {str(e)}"
-
-        try:
-            r = await client.get(f"{AHOTTS_API_URL}/health")
-            status["ahotts"] = r.json() if r.status_code == 200 else "error"
-        except Exception as e:
-            status["ahotts"] = f"unreachable: {str(e)}"
-
-    return status
+    return {
+        "status": "ok",
+        "preload": preload_state,
+        "models": {
+            "stt": {l: recognizer.is_loaded(l) for l in LANGS},
+            "mt": {
+                "es-eu": translator.is_loaded("es", "eu"),
+                "eu-es": translator.is_loaded("eu", "es"),
+            },
+            "tts": {l: synthesizer.is_loaded(l) for l in LANGS},
+        },
+        "busy": heavy_lock.locked(),
+    }
 
 
 @app.get("/api/voices")
 async def get_voices():
-    """Get available TTS voices."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            r = await client.get(f"{AHOTTS_API_URL}/voices")
-            return r.json()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"aHoTTS unavailable: {e}")
+    return {"modes": list(VOICE_MODES), "voices": config.VOICES}
+
+
+class SrtUpdate(BaseModel):
+    srt: str
 
 
 @app.get("/api/job/{job_id}")
 async def get_job_status(job_id: str):
-    """Get status of a translation job."""
-    if job_id in job_status:
-        return job_status[job_id]
-    return {"step": "unknown", "progress": 0, "detail": "Job not found"}
+    job = job_status.get(job_id)
+    if job is None:
+        return {"state": "unknown", "progress": 0, "detail": "Job not found"}
+    response = {k: job.get(k) for k in ("state", "progress", "detail")}
+    if job.get("state") == "awaiting_transcript_review":
+        response["srt"] = job.get("srt", "")
+    if job.get("state") == "awaiting_translation_review":
+        response["srt_translated"] = job.get("srt_translated", "")
+    if job.get("state") == "awaiting_synthesis_review":
+        response["audio_url"] = f"/api/job/{job_id}/audio"
+    if job.get("state") == "completed":
+        response["result"] = job.get("result")
+    return response
+
+
+@app.put("/api/job/{job_id}/srt")
+async def update_job_srt(job_id: str, body: SrtUpdate):
+    """SRT editatua gorde (transkripzioa edo itzulpena, berrikuspen-urratsean)."""
+    job = job_status.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    state = job.get("state")
+    if state == "awaiting_transcript_review":
+        key_chunks, key_srt = "chunks", "srt"
+    elif state == "awaiting_translation_review":
+        key_chunks, key_srt = "translated_chunks", "srt_translated"
+    else:
+        raise HTTPException(400, f"Job ez dago SRT-a editatzeko egoeran (egoera: {state})")
+    try:
+        chunks = srt_to_chunks(body.srt, job.get(key_chunks) or [])
+    except ValueError as e:
+        raise HTTPException(400, f"SRT baliogabea: {e}")
+    job[key_chunks] = chunks
+    job[key_srt] = chunks_to_srt(chunks)
+    return {"success": True}
+
+
+@app.post("/api/job/{job_id}/approve")
+async def approve_job_step(job_id: str):
+    job = job_status.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    state = job.get("state")
+    if state == "awaiting_transcript_review":
+        update_job(job_id, "translating", 45, "Testua itzultzen...")
+        asyncio.create_task(run_translation(job_id))
+    elif state == "awaiting_translation_review":
+        update_job(job_id, "synthesizing", 60, "Ahotsa sintetizatzen...")
+        asyncio.create_task(run_synthesis(job_id))
+    elif state == "awaiting_synthesis_review":
+        update_job(job_id, "finalizing", 90, "Bideo finala sortzen...")
+        asyncio.create_task(run_finalize(job_id))
+    else:
+        raise HTTPException(400, f"Job ez dago onarpen-urrats batean (egoera: {state})")
+    return {"success": True}
+
+
+@app.get("/api/job/{job_id}/audio")
+async def get_job_audio(job_id: str):
+    job = job_status.get(job_id)
+    if not job or not job.get("final_audio_path") or not Path(job["final_audio_path"]).exists():
+        raise HTTPException(404, "Audioa ez dago")
+    return FileResponse(job["final_audio_path"], media_type="audio/wav")
 
 
 @app.post("/api/translate")
 async def translate_video(
-    file: UploadFile = File(..., description="Video file to translate"),
-    source_lang: str = Form(..., description="Source language: es or eu"),
-    target_lang: str = Form(..., description="Target language: es or eu"),
-    voice: str = Form("antton", description="TTS voice name"),
+    file: UploadFile = File(..., description="Itzuli beharreko bideoa"),
+    source_lang: str = Form(...),
+    target_lang: str = Form(...),
+    voice: str = Form("auto", description="auto | female | male"),
 ):
-    """
-    Translate a video from one language to another.
-
-    Pipeline:
-    1. Extract audio from video
-    2. Transcribe audio (Whisper API)
-    3. Translate text (MarianMT)
-    4. Synthesize translated text (aHoTTS API)
-    5. Adjust speed to match original timing
-    6. Replace audio in video
-    """
-    if source_lang not in ("es", "eu"):
-        raise HTTPException(400, "source_lang must be 'es' or 'eu'")
-    if target_lang not in ("es", "eu"):
-        raise HTTPException(400, "target_lang must be 'es' or 'eu'")
+    """Bideoa igo eta transkripzioa abiarazi. Berehala itzultzen du job_id-a."""
+    if source_lang not in LANGS or target_lang not in LANGS:
+        raise HTTPException(400, "Hizkuntzak 'es' edo 'eu' izan behar dira")
     if source_lang == target_lang:
-        raise HTTPException(400, "source_lang and target_lang must be different")
+        raise HTTPException(400, "Jatorrizko eta helburu hizkuntzak desberdinak izan behar dira")
+    if voice not in VOICE_MODES:
+        voice = "auto"
 
-    job_id = str(uuid.uuid4())[:8]
-    update_job(job_id, "uploading", 5, "Uploading video...")
+    cleanup_old_files()
+    job_id = uuid.uuid4().hex[:8]
+    update_job(job_id, "uploading", 5, "Bideoa igotzen...")
 
-    # Save uploaded video
-    video_ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
-    video_path = str(UPLOAD_DIR / f"{job_id}{video_ext}")
+    suffix = Path(file.filename or "video.mp4").suffix.lower() or ".mp4"
+    if not re.fullmatch(r"\.[a-z0-9]{1,5}", suffix):
+        suffix = ".mp4"
+    video_path = str(config.UPLOAD_DIR / f"{job_id}{suffix}")
     with open(video_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+        while chunk := await file.read(1 << 20):
+            f.write(chunk)
 
+    job_status[job_id].update({
+        "video_path": video_path,
+        "source_lang": source_lang,
+        "target_lang": target_lang,
+        "voice_mode": voice,
+    })
+    asyncio.create_task(run_transcription(job_id))
+    return JSONResponse({"success": True, "job_id": job_id})
+
+
+# ---------------------------------------------------------------------------
+# Pipeline urratsak
+# ---------------------------------------------------------------------------
+def _progress_cb(job_id: str, state: str, lo: int, hi: int, label: str):
+    def cb(frac: float):
+        update_job(job_id, state, lo + int((hi - lo) * frac), f"{label} ({int(frac * 100)}%)")
+    return cb
+
+
+async def _wait_turn(job_id: str, state: str, progress: int):
+    if heavy_lock.locked():
+        update_job(job_id, state, progress, "Beste lan bat amaitu arte itxaroten...")
+
+
+async def run_transcription(job_id: str):
+    job = job_status[job_id]
     try:
-        # STEP 1: Extract audio
-        update_job(job_id, "extracting_audio", 10, "Extracting audio from video...")
-        audio_path = str(TEMP_DIR / f"{job_id}_audio.wav")
-        video_duration = extract_audio(video_path, audio_path)
-        logger.info(f"Video duration: {video_duration:.2f}s")
+        update_job(job_id, "extracting_audio", 10, "Audioa ateratzen bideotik...")
+        audio_path = str(config.TEMP_DIR / f"{job_id}_audio16k.wav")
+        duration = await asyncio.to_thread(extract_audio, job["video_path"], audio_path)
+        audio, _ = sf.read(audio_path, dtype="float32")
+        job["video_duration"] = duration
 
-        # STEP 2: Transcribe with Whisper API
-        update_job(job_id, "transcribing", 20, "Transcribing audio...")
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            with open(audio_path, "rb") as audio_file:
-                transcription_response = await client.post(
-                    f"{WHISPER_API_URL}/transcribe",
-                    files={"file": ("audio.wav", audio_file, "audio/wav")},
-                    data={
-                        "language": source_lang,
-                        "task": "transcribe",
-                        "return_timestamps": "true",
-                    },
-                )
-
-            if transcription_response.status_code != 200:
-                raise RuntimeError(
-                    f"Whisper API error: {transcription_response.text}"
-                )
-
-            transcription = transcription_response.json()
-            logger.info(f"Transcription: {transcription.get('text', '')[:200]}")
-
-        # STEP 3: Translate text
-        update_job(job_id, "translating", 40, "Translating text...")
-        chunks = transcription.get("chunks", [])
-
-        if chunks:
-            # Translate each chunk individually to maintain timing
-            translated_chunks = []
-            for chunk in chunks:
-                original_text = chunk.get("text", "").strip()
-                if not original_text:
-                    continue
-                translated_text = translator.translate(
-                    original_text, source_lang, target_lang
-                )
-                translated_chunks.append({
-                    "text": translated_text,
-                    "timestamp": chunk.get("timestamp", [0, 0]),
-                })
-            logger.info(f"Translated {len(translated_chunks)} chunks")
-        else:
-            # No chunks, translate full text
-            full_text = transcription.get("text", "")
-            translated_text = translator.translate(
-                full_text, source_lang, target_lang
+        await _wait_turn(job_id, "transcribing", 15)
+        async with heavy_lock:
+            update_job(job_id, "transcribing", 15, "Audioa transkribatzen...")
+            segments = await asyncio.to_thread(
+                recognizer.transcribe, audio, job["source_lang"],
+                _progress_cb(job_id, "transcribing", 15, 27, "Audioa transkribatzen"),
             )
-            translated_chunks = [{
-                "text": translated_text,
-                "timestamp": [0, video_duration],
-            }]
+            if not segments:
+                raise RuntimeError("Ez da hizketarik detektatu bideoan")
 
-        # STEP 4: Synthesize each chunk with aHoTTS
-        update_job(job_id, "synthesizing", 55, "Synthesizing translated speech...")
-        segment_paths = []
+            if job["voice_mode"] == "auto":
+                update_job(job_id, "transcribing", 28, "Esaldi bakoitzaren ahotsa aztertzen...")
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            prev_end = 0.0
-            for i, chunk in enumerate(translated_chunks):
-                progress = 55 + int(25 * (i / max(len(translated_chunks), 1)))
-                update_job(
-                    job_id, "synthesizing", progress,
-                    f"Synthesizing segment {i+1}/{len(translated_chunks)}..."
+                def detect():
+                    return fill_unknown([
+                        classify(median_f0(audio[a:b])) for a, b in (s["samples"] for s in segments)
+                    ])
+                genders = await asyncio.to_thread(detect)
+            else:
+                genders = [job["voice_mode"]] * len(segments)
+
+        chunks = [
+            {"text": s["text"], "timestamp": [round(s["start"], 3), round(s["end"], 3)], "gender": g}
+            for s, g in zip(segments, genders)
+        ]
+        job.update({"chunks": chunks, "srt": chunks_to_srt(chunks)})
+        update_job(job_id, "awaiting_transcript_review", 30,
+                   "Berrikusi transkripzioa eta ahotsak, eta onartu itzultzeko")
+    except Exception as e:
+        set_job_error(job_id, str(e))
+        logger.exception(f"[{job_id}] Transkripzioak huts egin du")
+
+
+async def run_translation(job_id: str):
+    job = job_status[job_id]
+    try:
+        chunks = job["chunks"]
+        await _wait_turn(job_id, "translating", 45)
+        async with heavy_lock:
+            update_job(job_id, "translating", 45, "Testua itzultzen...")
+            texts = await asyncio.to_thread(
+                translator.translate_batch, [c["text"] for c in chunks],
+                job["source_lang"], job["target_lang"],
+            )
+        translated = [
+            {"text": t, "timestamp": c["timestamp"], "gender": c.get("gender", "male")}
+            for c, t in zip(chunks, texts) if t
+        ]
+        job.update({"translated_chunks": translated, "srt_translated": chunks_to_srt(translated)})
+        update_job(job_id, "awaiting_translation_review", 55,
+                   "Berrikusi itzulpena eta onartu ahotsa sortzeko")
+    except Exception as e:
+        set_job_error(job_id, str(e))
+        logger.exception(f"[{job_id}] Itzulpenak huts egin du")
+
+
+async def run_synthesis(job_id: str):
+    job = job_status[job_id]
+    try:
+        chunks = job["translated_chunks"]
+        lang = job["target_lang"]
+        await _wait_turn(job_id, "synthesizing", 60)
+        async with heavy_lock:
+            items = []
+            for i, chunk in enumerate(chunks):
+                voice = config.VOICES.get(chunk["gender"], "")
+                update_job(job_id, "synthesizing", 60 + int(22 * i / max(len(chunks), 1)),
+                           f"Esaldia sintetizatzen {i + 1}/{len(chunks)} ({voice})...")
+                audio = await asyncio.to_thread(
+                    synthesizer.synthesize, chunk["text"], lang, chunk["gender"]
                 )
+                items.append({"start": chunk["timestamp"][0], "audio": audio})
 
-                ts = chunk["timestamp"]
-                chunk_start = ts[0] if ts[0] is not None else prev_end
-                chunk_end = ts[1] if ts[1] is not None else chunk_start + 3.0
-                chunk_duration = max(chunk_end - chunk_start, 0.5)
+            update_job(job_id, "combining", 83, "Audio zatiak denboran kokatzen...")
+            timeline = await asyncio.to_thread(
+                build_timeline, items, job["video_duration"], config.MAX_SPEEDUP
+            )
+        final_audio_path = str(config.TEMP_DIR / f"{job_id}_final.wav")
+        sf.write(final_audio_path, timeline, config.TTS_SAMPLE_RATE, subtype="PCM_16")
+        job["final_audio_path"] = final_audio_path
+        update_job(job_id, "awaiting_synthesis_review", 85,
+                   "Ahotsa sortuta. Entzun eta onartu bideo finala sortzeko")
+    except Exception as e:
+        set_job_error(job_id, str(e))
+        logger.exception(f"[{job_id}] Sintesiak huts egin du")
 
-                # Add silence gap if needed
-                gap = chunk_start - prev_end
-                if gap > 0.1:
-                    silence_path = str(TEMP_DIR / f"{job_id}_silence_{i}.wav")
-                    generate_silence(gap, silence_path)
-                    segment_paths.append(silence_path)
 
-                # Synthesize this chunk
-                synth_response = await client.post(
-                    f"{AHOTTS_API_URL}/synthesize",
-                    json={
-                        "text": chunk["text"],
-                        "language": target_lang,
-                        "voice": voice,
-                    },
-                )
+async def run_finalize(job_id: str):
+    job = job_status[job_id]
+    try:
+        update_job(job_id, "finalizing", 92, "Bideo finala sortzen...")
+        output_filename = f"{job_id}_{job['target_lang']}.mp4"
+        output_path = str(config.OUTPUT_DIR / output_filename)
+        await asyncio.to_thread(mux_video, job["video_path"], job["final_audio_path"], output_path)
 
-                if synth_response.status_code != 200:
-                    logger.error(
-                        f"TTS error for chunk {i}: {synth_response.text}"
-                    )
-                    # Generate silence instead
-                    silence_path = str(TEMP_DIR / f"{job_id}_fail_{i}.wav")
-                    generate_silence(chunk_duration, silence_path)
-                    segment_paths.append(silence_path)
-                    prev_end = chunk_end
-                    continue
-
-                # Save synthesized audio
-                raw_synth_path = str(TEMP_DIR / f"{job_id}_synth_{i}.wav")
-                with open(raw_synth_path, "wb") as sf:
-                    sf.write(synth_response.content)
-
-                # STEP 5: Adjust speed to match original timing
-                synth_duration = get_audio_duration(raw_synth_path)
-                if synth_duration > 0 and chunk_duration > 0:
-                    speed_factor = synth_duration / chunk_duration
-                    # Only adjust if significantly different
-                    if abs(speed_factor - 1.0) > 0.1:
-                        adjusted_path = str(
-                            TEMP_DIR / f"{job_id}_adjusted_{i}.wav"
-                        )
-                        speed_factor = max(0.5, min(2.0, speed_factor))
-                        adjust_audio_speed(
-                            raw_synth_path, adjusted_path, speed_factor
-                        )
-                        segment_paths.append(adjusted_path)
-                    else:
-                        segment_paths.append(raw_synth_path)
-                else:
-                    segment_paths.append(raw_synth_path)
-
-                prev_end = chunk_end
-
-            # Add trailing silence if video is longer
-            if prev_end < video_duration:
-                trailing_silence = str(TEMP_DIR / f"{job_id}_trailing.wav")
-                generate_silence(video_duration - prev_end, trailing_silence)
-                segment_paths.append(trailing_silence)
-
-        # STEP 6: Concatenate all segments
-        update_job(job_id, "combining", 85, "Combining audio segments...")
-        final_audio_path = str(TEMP_DIR / f"{job_id}_final_audio.wav")
-
-        if len(segment_paths) == 1:
-            final_audio_path = segment_paths[0]
-        else:
-            # Normalize all segments to same format before concat
-            normalized_paths = []
-            for idx, seg in enumerate(segment_paths):
-                norm_path = str(TEMP_DIR / f"{job_id}_norm_{idx}.wav")
-                cmd = [
-                    "ffmpeg", "-y", "-i", seg,
-                    "-ar", "22050", "-ac", "1", "-acodec", "pcm_s16le",
-                    norm_path
-                ]
-                subprocess.run(cmd, capture_output=True, text=True)
-                normalized_paths.append(norm_path)
-
-            concatenate_audio_segments(normalized_paths, final_audio_path)
-
-        # STEP 7: Replace audio in video
-        update_job(job_id, "finalizing", 90, "Creating final video...")
-        output_filename = f"{job_id}_translated{video_ext}"
-        output_path = str(OUTPUT_DIR / output_filename)
-        replace_audio_in_video(video_path, final_audio_path, output_path)
-
-        update_job(job_id, "completed", 100, "Translation complete!")
-
-        # Cleanup temp files
-        for p in TEMP_DIR.glob(f"{job_id}_*"):
+        for p in config.TEMP_DIR.glob(f"{job_id}_*"):
             try:
                 p.unlink()
             except OSError:
                 pass
+        job.pop("final_audio_path", None)
 
-        return JSONResponse({
-            "success": True,
-            "job_id": job_id,
-            "download_url": f"/api/download/{output_filename}",
-            "transcription": transcription.get("text", ""),
-            "translated_text": " ".join(c["text"] for c in translated_chunks),
+        job.update({
+            "state": "completed",
+            "progress": 100,
+            "detail": "Itzulpena amaituta!",
+            "result": {
+                "success": True,
+                "job_id": job_id,
+                "download_url": f"/api/download/{output_filename}",
+                "transcription": " ".join(c["text"] for c in job["chunks"]),
+                "translated_text": " ".join(c["text"] for c in job["translated_chunks"]),
+                "srt_translated": job.get("srt_translated", ""),
+            },
         })
-
+        logger.info(f"[{job_id}] completed (100%)")
     except Exception as e:
-        update_job(job_id, "error", -1, str(e))
-        logger.exception(f"Translation failed for job {job_id}")
-        raise HTTPException(status_code=500, detail=str(e))
+        set_job_error(job_id, str(e))
+        logger.exception(f"[{job_id}] Bideo finalak huts egin du")
 
 
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
-    """Download a translated video."""
-    file_path = OUTPUT_DIR / filename
+    if Path(filename).name != filename or not filename.endswith(".mp4"):
+        raise HTTPException(400, "Fitxategi-izen baliogabea")
+    file_path = config.OUTPUT_DIR / filename
     if not file_path.exists():
         raise HTTPException(404, "File not found")
-    return FileResponse(
-        path=str(file_path),
-        media_type="video/mp4",
-        filename=filename,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=False)
+    return FileResponse(str(file_path), media_type="video/mp4", filename=filename)

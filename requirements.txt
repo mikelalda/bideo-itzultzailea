@@ -1,14 +1,28 @@
-# Core web framework
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-python-multipart==0.0.20
-jinja2==3.1.4
-aiofiles==24.1.0
+# torch (CPU) Dockerfile-an instalatzen da aurretik, PyTorch-en CPU indizetik:
+#   pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
 
-# HTTP client
-httpx==0.28.1
+# Web zerbitzaria
+fastapi==0.164.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.34
+jinja2==3.1.6
 
-# Translation models (MarianMT)
-torch>=2.1.0
-transformers>=4.40.0
-sentencepiece>=0.2.0
+# STT - NVIDIA NeMo (Conformer-Transducer) + silero VAD
+nemo_toolkit[asr]==3.0.0
+silero-vad==6.2.3
+
+# MT - HiTZ MarianMT
+transformers==5.23.0
+sentencepiece==0.2.3
+
+# TTS - Pocket TTS ONNX
+onnxruntime==1.32.0
+safetensors==0.8.0
+
+# Audioa eta tresnak
+numpy==2.5.5
+scipy==1.18.1
+librosa==1.0.1
+soundfile==0.14.0
+huggingface_hub==2.4.0
+num2words==0.5.14

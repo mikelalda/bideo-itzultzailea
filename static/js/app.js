@@ -34,25 +34,26 @@ const errorCard = document.getElementById('errorCard');
 const errorText = document.getElementById('errorText');
 const retryBtn = document.getElementById('retryBtn');
 
-// Voice options per target language
-const VOICES = {
-    eu: [
-        { value: 'antton', label: 'Antton (gizona)' },
-        { value: 'maider', label: 'Maider (emakumea)' },
-    ],
-    es: [
-        { value: 'laura', label: 'Laura (mujer)' },
-        { value: 'alejandro', label: 'Alejandro (hombre)' },
-    ],
-};
+// Step-by-step review cards
+const transcriptReviewCard = document.getElementById('transcriptReviewCard');
+const transcriptSrtEditor = document.getElementById('transcriptSrtEditor');
+const approveTranscriptBtn = document.getElementById('approveTranscriptBtn');
+const translationReviewCard = document.getElementById('translationReviewCard');
+const translationSrtViewer = document.getElementById('translationSrtViewer');
+const approveTranslationBtn = document.getElementById('approveTranslationBtn');
+const synthesisReviewCard = document.getElementById('synthesisReviewCard');
+const approveSynthesisBtn = document.getElementById('approveSynthesisBtn');
+
+let currentJobId = null;
+
+const synthesisAudio = document.getElementById('synthesisAudio');
 
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
     checkHealth();
-    updateVoiceOptions();
-    setInterval(checkHealth, 30000);
+    setInterval(checkHealth, 15000);
 });
 
 // ---------------------------------------------------------------------------
@@ -60,29 +61,24 @@ document.addEventListener('DOMContentLoaded', () => {
 // ---------------------------------------------------------------------------
 async function checkHealth() {
     const dots = {
-        orchestrator: document.getElementById('statusOrchestrator'),
-        whisper: document.getElementById('statusWhisper'),
-        ahotts: document.getElementById('statusAhotts'),
+        stt: document.getElementById('statusStt'),
+        mt: document.getElementById('statusMt'),
+        tts: document.getElementById('statusTts'),
     };
-
-    // Set loading
-    Object.values(dots).forEach(d => d.className = 'status-dot loading');
 
     try {
         const res = await fetch(`${API_BASE}/api/health`);
         const data = await res.json();
-
-        dots.orchestrator.className = 'status-dot ok';
-
-        dots.whisper.className = data.whisper && typeof data.whisper === 'object'
-            ? 'status-dot ok' : 'status-dot error';
-
-        dots.ahotts.className = data.ahotts && typeof data.ahotts === 'object'
-            ? 'status-dot ok' : 'status-dot error';
+        const models = data.models || {};
+        const failed = data.preload && data.preload.error;
+        Object.entries(dots).forEach(([key, dot]) => {
+            const loaded = Object.values(models[key] || {});
+            const ready = loaded.length > 0 && loaded.every(Boolean);
+            dot.className = 'status-dot ' + (ready ? 'ok' : (failed ? 'error' : 'loading'));
+            dot.title = ready ? 'Prest' : (failed ? data.preload.error : 'Eredua kargatzen...');
+        });
     } catch {
-        dots.orchestrator.className = 'status-dot error';
-        dots.whisper.className = 'status-dot error';
-        dots.ahotts.className = 'status-dot error';
+        Object.values(dots).forEach(d => d.className = 'status-dot error');
     }
 }
 
@@ -165,37 +161,22 @@ swapLangs.addEventListener('click', () => {
     const tgt = targetLang.value;
     sourceLang.value = tgt;
     targetLang.value = src;
-    updateVoiceOptions();
 });
 
 sourceLang.addEventListener('change', () => {
     if (sourceLang.value === targetLang.value) {
         targetLang.value = sourceLang.value === 'es' ? 'eu' : 'es';
     }
-    updateVoiceOptions();
 });
 
 targetLang.addEventListener('change', () => {
     if (targetLang.value === sourceLang.value) {
         sourceLang.value = targetLang.value === 'es' ? 'eu' : 'es';
     }
-    updateVoiceOptions();
 });
 
-function updateVoiceOptions() {
-    const lang = targetLang.value;
-    const voices = VOICES[lang] || [];
-    voiceSelect.innerHTML = '';
-    voices.forEach(v => {
-        const opt = document.createElement('option');
-        opt.value = v.value;
-        opt.textContent = v.label;
-        voiceSelect.appendChild(opt);
-    });
-}
-
 // ---------------------------------------------------------------------------
-// Form Submission
+// Form Submission (urrats-1: bideoa igo + transkribatu)
 // ---------------------------------------------------------------------------
 translateForm.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -210,21 +191,24 @@ translateForm.addEventListener('submit', async (e) => {
         return;
     }
 
-    // Prepare form data
     const formData = new FormData();
     formData.append('file', selectedFile);
     formData.append('source_lang', sourceLang.value);
     formData.append('target_lang', targetLang.value);
     formData.append('voice', voiceSelect.value);
 
-    // Show progress
     hideError();
     resultsCard.style.display = 'none';
+    transcriptReviewCard.style.display = 'none';
+    translationReviewCard.style.display = 'none';
+    synthesisReviewCard.style.display = 'none';
     progressCard.style.display = 'block';
     submitBtn.disabled = true;
     resetProgress();
 
     try {
+        // Berehala itzultzen du job_id bat -- pipeline osoa ez du itxaron
+        // behar (HF Spaces-en proxy-ak eskaera luzeak mozten ditu ~60s-tara).
         const res = await fetch(`${API_BASE}/api/translate`, {
             method: 'POST',
             body: formData,
@@ -235,26 +219,184 @@ translateForm.addEventListener('submit', async (e) => {
             throw new Error(err.detail || 'Translation failed');
         }
 
-        const data = await res.json();
-
-        // Show results
-        updateProgress('completed', 100, 'Itzulpena amaituta!');
-        markAllStepsDone();
-
-        originalText.textContent = data.transcription || '(ez dago testurik)';
-        translatedText.textContent = data.translated_text || '(ez dago testurik)';
-        downloadBtn.href = data.download_url;
-
-        setTimeout(() => {
-            progressCard.style.display = 'none';
-            resultsCard.style.display = 'block';
-        }, 1000);
+        const { job_id } = await res.json();
+        currentJobId = job_id;
+        startPolling(job_id);
 
     } catch (err) {
         showError(err.message);
         progressCard.style.display = 'none';
-    } finally {
         submitBtn.disabled = false;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Polling: pipeline pausuz pausu doa, eta erabiltzailearen onarpenaren zain
+// gelditzen da urrats bakoitzaren ondoren (transkripzioa, itzulpena,
+// sintesia). Job-aren egoerak dio zein card erakutsi.
+// ---------------------------------------------------------------------------
+function startPolling(jobId) {
+    if (pollInterval) clearInterval(pollInterval);
+
+    pollInterval = setInterval(async () => {
+        try {
+            const res = await fetch(`${API_BASE}/api/job/${jobId}`);
+            const data = await res.json();
+
+            updateProgress(data.state, data.progress, data.detail);
+
+            switch (data.state) {
+                case 'awaiting_transcript_review':
+                    stopPolling();
+                    transcriptSrtEditor.value = data.srt || '';
+                    progressCard.style.display = 'none';
+                    transcriptReviewCard.style.display = 'block';
+                    submitBtn.disabled = false;
+                    break;
+
+                case 'awaiting_translation_review':
+                    stopPolling();
+                    translationSrtViewer.value = data.srt_translated || '';
+                    progressCard.style.display = 'none';
+                    translationReviewCard.style.display = 'block';
+                    break;
+
+                case 'awaiting_synthesis_review':
+                    stopPolling();
+                    synthesisAudio.src = `${data.audio_url}?t=${Date.now()}`;
+                    progressCard.style.display = 'none';
+                    synthesisReviewCard.style.display = 'block';
+                    break;
+
+                case 'completed': {
+                    stopPolling();
+                    markAllStepsDone();
+                    const result = data.result || {};
+                    originalText.textContent = result.transcription || '(ez dago testurik)';
+                    translatedText.textContent = result.translated_text || '(ez dago testurik)';
+                    downloadBtn.href = result.download_url;
+                    setTimeout(() => {
+                        progressCard.style.display = 'none';
+                        resultsCard.style.display = 'block';
+                    }, 800);
+                    break;
+                }
+
+                case 'error':
+                    stopPolling();
+                    submitBtn.disabled = false;
+                    showError(data.detail || 'Translation failed');
+                    progressCard.style.display = 'none';
+                    break;
+            }
+        } catch (err) {
+            stopPolling();
+            submitBtn.disabled = false;
+            showError(err.message);
+        }
+    }, 1500);
+}
+
+function stopPolling() {
+    if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Urrats-1 onarpena: SRT (agian editatua) bidali eta itzulpena abiarazi
+// ---------------------------------------------------------------------------
+approveTranscriptBtn.addEventListener('click', async () => {
+    if (!currentJobId) return;
+    approveTranscriptBtn.disabled = true;
+    try {
+        const putRes = await fetch(`${API_BASE}/api/job/${currentJobId}/srt`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ srt: transcriptSrtEditor.value }),
+        });
+        if (!putRes.ok) {
+            const err = await putRes.json().catch(() => ({ detail: putRes.statusText }));
+            throw new Error(err.detail || 'SRT ez da onartu');
+        }
+
+        const approveRes = await fetch(`${API_BASE}/api/job/${currentJobId}/approve`, {
+            method: 'POST',
+        });
+        if (!approveRes.ok) {
+            const err = await approveRes.json().catch(() => ({ detail: approveRes.statusText }));
+            throw new Error(err.detail || 'Ezin izan da itzulpena abiarazi');
+        }
+
+        transcriptReviewCard.style.display = 'none';
+        progressCard.style.display = 'block';
+        startPolling(currentJobId);
+    } catch (err) {
+        showError(err.message);
+    } finally {
+        approveTranscriptBtn.disabled = false;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Urrats-2 onarpena: itzulpena onartu, ahotsa sortu
+// ---------------------------------------------------------------------------
+approveTranslationBtn.addEventListener('click', async () => {
+    if (!currentJobId) return;
+    approveTranslationBtn.disabled = true;
+    try {
+        const putRes = await fetch(`${API_BASE}/api/job/${currentJobId}/srt`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ srt: translationSrtViewer.value }),
+        });
+        if (!putRes.ok) {
+            const err = await putRes.json().catch(() => ({ detail: putRes.statusText }));
+            throw new Error(err.detail || 'SRT ez da onartu');
+        }
+
+        const approveRes = await fetch(`${API_BASE}/api/job/${currentJobId}/approve`, {
+            method: 'POST',
+        });
+        if (!approveRes.ok) {
+            const err = await approveRes.json().catch(() => ({ detail: approveRes.statusText }));
+            throw new Error(err.detail || 'Ezin izan da ahotsa abiarazi');
+        }
+
+        translationReviewCard.style.display = 'none';
+        progressCard.style.display = 'block';
+        startPolling(currentJobId);
+    } catch (err) {
+        showError(err.message);
+    } finally {
+        approveTranslationBtn.disabled = false;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Urrats-3 onarpena: ahotsa onartu, bideo finala sortu
+// ---------------------------------------------------------------------------
+approveSynthesisBtn.addEventListener('click', async () => {
+    if (!currentJobId) return;
+    approveSynthesisBtn.disabled = true;
+    try {
+        const approveRes = await fetch(`${API_BASE}/api/job/${currentJobId}/approve`, {
+            method: 'POST',
+        });
+        if (!approveRes.ok) {
+            const err = await approveRes.json().catch(() => ({ detail: approveRes.statusText }));
+            throw new Error(err.detail || 'Ezin izan da bideo finala abiarazi');
+        }
+
+        synthesisAudio.pause();
+        synthesisReviewCard.style.display = 'none';
+        progressCard.style.display = 'block';
+        startPolling(currentJobId);
+    } catch (err) {
+        showError(err.message);
+    } finally {
+        approveSynthesisBtn.disabled = false;
     }
 });
 
@@ -313,48 +455,18 @@ retryBtn.addEventListener('click', () => {
 
 newTranslationBtn.addEventListener('click', () => {
     resultsCard.style.display = 'none';
+    transcriptReviewCard.style.display = 'none';
+    translationReviewCard.style.display = 'none';
+    synthesisReviewCard.style.display = 'none';
+    currentJobId = null;
     clearFile();
     resetProgress();
 });
 
 // ---------------------------------------------------------------------------
-// Progress polling using XHR upload progress for large files
-// ---------------------------------------------------------------------------
-// The main form submission already handles progress via the fetch response.
-// For real-time progress during long translations, we poll the job status.
-// However, since the translate endpoint is synchronous (returns when done),
-// we use a simulated progress approach based on the request duration.
-
-// Enhance the form submission with XHR for upload progress tracking
-const originalSubmitHandler = translateForm.onsubmit;
-
-function simulateProgress() {
-    let progress = 5;
-    const steps = [
-        { step: 'uploading', progress: 10, text: 'Bideoa igotzen...', delay: 500 },
-        { step: 'extracting_audio', progress: 15, text: 'Audioa ateratzen...', delay: 2000 },
-        { step: 'transcribing', progress: 25, text: 'Audioa transkribatzen...', delay: 3000 },
-        { step: 'translating', progress: 45, text: 'Testua itzultzen...', delay: 5000 },
-        { step: 'synthesizing', progress: 65, text: 'Ahotsa sintetizatzen...', delay: 8000 },
-        { step: 'combining', progress: 85, text: 'Audio segmentuak konbinatzen...', delay: 12000 },
-        { step: 'finalizing', progress: 92, text: 'Bideo finala sortzen...', delay: 15000 },
-    ];
-
-    steps.forEach(s => {
-        setTimeout(() => {
-            if (progressCard.style.display !== 'none') {
-                updateProgress(s.step, s.progress, s.text);
-            }
-        }, s.delay);
-    });
-}
-
-// Override form submit to add progress simulation
-const form = document.getElementById('translateForm');
-form.removeEventListener('submit', () => {});
-
-// Patch: add progress simulation when form is submitted
-const origBtnClick = submitBtn.onclick;
-translateForm.addEventListener('submit', () => {
-    simulateProgress();
-}, { capture: true });
+// Progress reporting is now REAL, not simulated: see startPolling() above, which
+// polls GET /api/job/{job_id} while the backend runs the pipeline as a
+// background task. This replaces the old simulateProgress() timer-based
+// fake progress bar, which was needed only because /api/translate used to
+// block until the whole pipeline finished (and got killed by the HF Spaces
+// proxy's ~60s timeout on long-running requests).
